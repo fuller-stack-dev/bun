@@ -3,7 +3,7 @@
 // Node ref: https://github.com/nodejs/node/blob/main/lib/internal/child_process/serialization.js
 
 const { Buffer } = require("node:buffer");
-const { isUint8Array } = require("node:util/types");
+const { isNativeError, isUint8Array } = require("node:util/types");
 const BufferPrototype = Buffer.prototype;
 const isBuffer = Buffer.isBuffer;
 const ObjectKeys = Object.keys;
@@ -40,8 +40,12 @@ function tagBuffers(value: unknown): [unknown, unknown[]] | null {
       current.$forEach(entry => $arrayPush(stack, entry));
       continue;
     }
-    // Objects, arrays and errors: the serializer walks own enumerable
-    // properties. Only data properties are descended so no getter runs here.
+    // Error causes are usually non-enumerable, but are part of the serialized graph.
+    if (isNativeError(current)) {
+      const cause = ObjectGetOwnPropertyDescriptor(current, "cause");
+      if (cause && ObjectPrototypeHasOwnProperty.$call(cause, "value")) $arrayPush(stack, cause.value);
+    }
+    // Only data properties are descended so no getter runs here.
     const keys = ObjectKeys(current);
     for (let i = 0; i < keys.length; i++) {
       const desc = ObjectGetOwnPropertyDescriptor(current, keys[i]);

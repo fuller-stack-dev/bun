@@ -50,6 +50,38 @@ describe("v8 serialize/deserialize Buffer identity", () => {
     expect(Buffer.isBuffer(value.v)).toBe(true);
   });
 
+  test("Error.cause-only Buffers retain their type and graph identity", () => {
+    const buffer = Buffer.from("cause").subarray(1, 4);
+    const error = new Error("outer", { cause: new Map([[buffer, buffer]]) });
+    const out = v8.deserialize(v8.serialize(error));
+    expect(out).toBeInstanceOf(Error);
+    expect(out.cause).toBeInstanceOf(Map);
+    const [[key, value]] = [...out.cause];
+    expect(Buffer.isBuffer(key)).toBe(true);
+    expect(key).toBe(value);
+    expect(key.toString()).toBe("aus");
+  });
+
+  test("Error.cause Buffer scanning terminates on Error cycles without invoking accessors", () => {
+    const error = new Error("outer");
+    const nested = new Error("inner", { cause: error });
+    const accessor = new Error("accessor");
+    let reads = 0;
+    Object.defineProperty(accessor, "cause", {
+      get() {
+        reads++;
+        throw new Error("must not read accessor");
+      },
+    });
+    error.cause = [nested, Buffer.from("cycle"), accessor];
+    const out = v8.deserialize(v8.serialize(error));
+    expect(out.cause[0].cause).toBe(out);
+    expect(Buffer.isBuffer(out.cause[1])).toBe(true);
+    expect(out.cause[1].toString()).toBe("cycle");
+    expect(Object.hasOwn(out.cause[2], "cause")).toBe(false);
+    expect(reads).toBe(0);
+  });
+
   test("Buffer-free payloads keep the bare format (old readers still work)", () => {
     const jsc = require("bun:jsc");
     const bytes = v8.serialize({ n: 1, s: "x" });

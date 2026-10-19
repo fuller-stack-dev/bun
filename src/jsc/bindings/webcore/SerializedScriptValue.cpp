@@ -2241,7 +2241,7 @@ SerializationReturnCode CloneSerializer::serialize(JSValue in)
             {
                 if (inputObjectStack.size() > maximumFilterRecursion)
                     return SerializationReturnCode::StackOverflowError;
-                auto* error = jsCast<ErrorInstance*>(inValue);
+                auto* error = uncheckedDowncast<ErrorInstance>(inValue);
                 if (!startObjectInternal(error))
                     break;
                 JSValue cause = dumpError(error);
@@ -4208,7 +4208,7 @@ DeserializationResult CloneDeserializer::deserialize()
             }
         case ErrorEndVisitCause: {
             auto* error = outputObjectStack.last();
-            error->putDirect(vm, vm.propertyNames->cause, outValue, PropertyAttribute::DontEnum);
+            error->putDirect(vm, vm.propertyNames->cause, outValue, static_cast<unsigned>(PropertyAttribute::DontEnum));
             if (scope.exception())
                 goto error;
             outValue = error;
