@@ -73,13 +73,42 @@ describe("v8 serialize/deserialize Buffer identity", () => {
     };
     Object.defineProperty(source, field, field === "message" ? { value: { toString: effect } } : { get: effect });
     const out = v8.deserialize(v8.serialize(source));
-    expect(calls).toBeGreaterThan(0);
+    expect(calls).toBe(1);
     expect(Buffer.isBuffer(out.cause)).toBe(true);
     expect(out.cause.toString()).toBe("rigi");
     expect(out.cause.length).toBe(4);
   });
 
-  test("Error.cause Buffer scanning terminates on Error cycles without invoking accessors", () => {
+  for (const initial of ["buffer", "absent"]) {
+    test.each(["name", "message", "stack"])(
+      `later Error with ${initial} cause retains a Buffer introduced by %s effects`,
+      field => {
+        const later = initial === "buffer" ? new Error("later", { cause: Buffer.from("old") }) : new Error("later");
+        const first = new Error("first");
+        first.stack = "";
+        let calls = 0;
+        const effect = () => {
+          calls++;
+          const buffer = Buffer.from("!new!").subarray(1, 4);
+          later.cause = new Map([[buffer, [buffer, buffer]]]);
+          return field === "name" ? "Error" : "metadata";
+        };
+        Object.defineProperty(first, field, field === "message" ? { value: { toString: effect } } : { get: effect });
+        const out = v8.deserialize(v8.serialize([first, later, later]));
+        expect(calls).toBe(1);
+        expect(out[1]).toBe(out[2]);
+        expect(out[1].cause).toBeInstanceOf(Map);
+        const [[key, values]] = [...out[1].cause];
+        expect(Array.from(key)).toEqual([110, 101, 119]);
+        expect(Buffer.isBuffer(key)).toBe(true);
+        expect(key.toString()).toBe("new");
+        expect(values[0]).toBe(key);
+        expect(values[1]).toBe(key);
+      },
+    );
+  }
+
+  test("Error.cause Buffer serialization terminates on Error cycles without invoking accessors", () => {
     const error = new Error("outer");
     const nested = new Error("inner", { cause: error });
     const accessor = new Error("accessor");
@@ -107,6 +136,95 @@ describe("v8 serialize/deserialize Buffer identity", () => {
     // deserialize also accepts current bare output from jsc.serialize.
     const bare = jsc.serialize({ buf: new Uint8Array([7]) }, { binaryType: "nodebuffer" });
     expect(v8.deserialize(bare)).toEqual({ buf: new Uint8Array([7]) });
+  });
+
+  test.each([249, 250, 251, 252, 65529, 65530, 65531, 65532])("Buffer envelope retains aliases across %i values", count => {
+    const buffer = Buffer.from("slots");
+    const values = Array.from({ length: count }, (_, index) => ({ index }));
+    const input: any = { values, buffer, again: buffer, first: values[0], last: values.at(-1) };
+    input.self = input;
+    const out = v8.deserialize(v8.serialize(input));
+    expect(out.self).toBe(out);
+    expect(out.first).toBe(out.values[0]);
+    expect(out.last).toBe(out.values.at(-1));
+    expect(out.buffer).toBe(out.again);
+    expect(Buffer.isBuffer(out.buffer)).toBe(true);
+    expect(out.buffer.toString()).toBe("slots");
+  });
+
+  test("Buffer-free Error graphs retain byte-for-byte bare framing", () => {
+    const jsc = require("bun:jsc");
+    const error = new Error("bare", { cause: new Map([["cause", { n: 1 }]]) });
+    error.stack = "stable";
+    const input = [error, error];
+    expect(v8.serialize(input)).toEqual(jsc.serialize(input, { binaryType: "nodebuffer" }));
+  });
+
+  test("only serialized Buffer identities are tagged, including getter results and subclasses", () => {
+    const buffer = Buffer.from("visible");
+    Object.setPrototypeOf(buffer, Object.create(Buffer.prototype));
+    let reads = 0;
+    const ignored = new Map();
+    Object.defineProperty(ignored, "extra", { value: Buffer.from("ignored"), enumerable: true });
+    const bytes = v8.serialize({
+      get value() {
+        reads++;
+        return buffer;
+      },
+      ignored,
+    });
+    const envelope = require("bun:jsc").deserialize(bytes.subarray(5));
+    expect(reads).toBe(1);
+    expect(envelope[1]).toHaveLength(1);
+    expect(envelope[1][0]).toBe(envelope[0].value);
+    const out = v8.deserialize(bytes);
+    expect(Buffer.isBuffer(out.value)).toBe(true);
+    expect(out.value.toString()).toBe("visible");
+    expect(Reflect.ownKeys(out.ignored)).toEqual([]);
+  });
+
+  test("advanced IPC tags Buffers introduced by earlier Error metadata", async () => {
+    const source = [
+      'let calls = 0;',
+      'for (const initial of ["buffer", "absent"]) for (const field of ["name", "message", "stack"]) {',
+      ' const later = initial === "buffer" ? new Error("later", { cause: Buffer.from("old") }) : new Error("later");',
+      ' const first = new Error("first"); first.stack = "";',
+      ' const effect = () => { calls++; const b = Buffer.from("new"); later.cause = new Map([[b, b]]); return field === "name" ? "Error" : "metadata"; };',
+      ' Object.defineProperty(first, field, field === "message" ? { value: { toString: effect } } : { get: effect });',
+      ' process.send([first, later, later]);',
+      '}',
+      'process.send({ done: true, calls });',
+      'process.on("message", () => {});',
+    ].join("\n");
+    const { promise, resolve, reject } = Promise.withResolvers<void>();
+    const messages: any[] = [];
+    let calls;
+    await using child = Bun.spawn({
+      cmd: [bunExe(), "-e", source],
+      env: bunEnv,
+      stdout: "ignore",
+      stderr: "inherit",
+      serialization: "advanced",
+      ipc(message) {
+        if (message?.done) {
+          calls = message.calls;
+          resolve();
+        } else messages.push(message);
+      },
+      onExit(_child, code, signal) {
+        reject(new Error("IPC child exited before completion: " + code + "/" + signal));
+      },
+    });
+    await promise;
+    expect(calls).toBe(6);
+    expect(messages).toHaveLength(6);
+    for (const out of messages) {
+      expect(out[1]).toBe(out[2]);
+      const [[key, value]] = [...out[1].cause];
+      expect(key).toBe(value);
+      expect(Buffer.isBuffer(key)).toBe(true);
+      expect(key.toString()).toBe("new");
+    }
   });
 
   test("rejects an envelope whose buffer list holds a non-Uint8Array view", () => {

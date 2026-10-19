@@ -13,12 +13,14 @@ struct SerializedValueSlice {
     const uint8_t* bytes;
     size_t size;
     WebCore::SerializedScriptValue* value; // NOLINT
+    bool hasBufferEnvelope;
 };
 
 enum class SerializedFlags : uint8_t {
     None = 0,
     ForCrossProcessTransfer = 1 << 0,
     ForStorage = 1 << 1,
+    PreserveNodeBuffers = 1 << 2,
 };
 
 /// Returns a "slice" that also contains a pointer to the SerializedScriptValue. Must be freed by the caller
@@ -33,7 +35,11 @@ extern "C" SerializedValueSlice Bun__serializeJSValue(JSGlobalObject* globalObje
     auto forStorage = (static_cast<uint8_t>(flags) & static_cast<uint8_t>(SerializedFlags::ForStorage)) ? SerializationForStorage::Yes : SerializationForStorage::No;
     auto context = SerializationContext::Default;
     auto forTransferEnum = (static_cast<uint8_t>(flags) & static_cast<uint8_t>(SerializedFlags::ForCrossProcessTransfer)) ? SerializationForCrossProcessTransfer::Yes : SerializationForCrossProcessTransfer::No;
-    ExceptionOr<Ref<SerializedScriptValue>> serialized = SerializedScriptValue::create(*globalObject, value, WTF::move(transferList), dummyPorts, forStorage, context, forTransferEnum);
+    bool hasBufferEnvelope = false;
+    bool preserveNodeBuffers = static_cast<uint8_t>(flags) & static_cast<uint8_t>(SerializedFlags::PreserveNodeBuffers);
+    ExceptionOr<Ref<SerializedScriptValue>> serialized = preserveNodeBuffers
+        ? SerializedScriptValue::createForNode(*globalObject, value, forStorage, forTransferEnum, hasBufferEnvelope)
+        : SerializedScriptValue::create(*globalObject, value, WTF::move(transferList), dummyPorts, forStorage, context, forTransferEnum);
 
     EXCEPTION_ASSERT(!!scope.exception() == serialized.hasException());
     if (serialized.hasException()) {
@@ -49,6 +55,7 @@ extern "C" SerializedValueSlice Bun__serializeJSValue(JSGlobalObject* globalObje
         bytes.begin(),
         bytes.size(),
         &serializedValue.leakRef(),
+        hasBufferEnvelope,
     };
 }
 

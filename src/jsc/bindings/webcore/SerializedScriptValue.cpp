@@ -730,15 +730,20 @@ public:
 #endif
         Vector<uint8_t>& out, SerializationContext context, ArrayBufferContentsArray& sharedBuffers,
         Vector<void*>& serializedBlockListRefs,
-        SerializationForStorage forStorage, SerializationForCrossProcessTransfer forTransfer)
+        SerializationForStorage forStorage, SerializationForCrossProcessTransfer forTransfer, bool* hasBufferEnvelope)
     {
         CloneSerializer serializer(lexicalGlobalObject, messagePorts, arrayBuffers,
 #if ENABLE(WEBASSEMBLY)
             wasmModules,
             wasmMemoryHandles,
 #endif
-            out, context, sharedBuffers, forStorage, forTransfer);
+            out, context, sharedBuffers, forStorage, forTransfer, hasBufferEnvelope != nullptr);
         auto code = serializer.serialize(value);
+        if (code == SerializationReturnCode::SuccessfullyCompleted && hasBufferEnvelope) {
+            *hasBufferEnvelope = serializer.finishBufferEnvelope();
+            if (serializer.m_failed)
+                code = SerializationReturnCode::UnspecifiedError;
+        }
         serializedBlockListRefs = WTF::move(serializer.m_serializedBlockListRefs);
         return code;
     }
@@ -751,7 +756,7 @@ private:
         WasmModuleArray& wasmModules,
         WasmMemoryHandleArray& wasmMemoryHandles,
 #endif
-        Vector<uint8_t>& out, SerializationContext context, ArrayBufferContentsArray& sharedBuffers, SerializationForStorage forStorage, SerializationForCrossProcessTransfer forTransfer)
+        Vector<uint8_t>& out, SerializationContext context, ArrayBufferContentsArray& sharedBuffers, SerializationForStorage forStorage, SerializationForCrossProcessTransfer forTransfer, bool preserveNodeBuffers = false)
         : CloneBase(lexicalGlobalObject)
         , m_buffer(out)
         , m_emptyIdentifier(Identifier::fromString(lexicalGlobalObject->vm(), emptyString()))
@@ -763,6 +768,7 @@ private:
 #endif
         , m_forStorage(forStorage)
         , m_forTransfer(forTransfer)
+        , m_preserveNodeBuffers(preserveNodeBuffers)
     {
         write(CurrentVersion);
         fillTransferMap(messagePorts, m_transferredMessagePorts);
@@ -1024,6 +1030,23 @@ private:
             return buffer;
 
         return JSC::JSArrayBuffer::create(vm, globalObject->arrayBufferStructure(arrayBuffer.sharingMode()), &arrayBuffer);
+    }
+
+    bool isNodeBuffer(JSObject* object)
+    {
+        if (!object->inherits<JSUint8Array>())
+            return false;
+        auto& vm = m_lexicalGlobalObject->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        auto prototype = defaultGlobalObject(m_lexicalGlobalObject)->JSBufferSubclassStructure()->storedPrototype();
+        for (JSValue current = object->getPrototype(m_lexicalGlobalObject); current.isObject();) {
+            RETURN_IF_EXCEPTION(scope, false);
+            if (current == prototype)
+                return true;
+            current = asObject(current)->getPrototype(m_lexicalGlobalObject);
+        }
+        RETURN_IF_EXCEPTION(scope, false);
+        return false;
     }
 
     bool dumpArrayBufferView(JSObject* obj, SerializationReturnCode& code)
@@ -1361,6 +1384,12 @@ private:
                 bool success = dumpArrayBufferView(obj, code);
                 RETURN_IF_EXCEPTION(scope, false);
                 recordObject(obj);
+                if (m_preserveNodeBuffers && success && code == SerializationReturnCode::SuccessfullyCompleted) {
+                    bool isBuffer = isNodeBuffer(obj);
+                    RETURN_IF_EXCEPTION(scope, false);
+                    if (isBuffer)
+                        m_nodeBufferIndices.append(m_objectPool.find(obj)->value);
+                }
                 return success;
             }
 #if ENABLE(WEB_CRYPTO)
@@ -1653,7 +1682,65 @@ private:
 
     void writeObjectIndex(unsigned i)
     {
+        if (m_preserveNodeBuffers)
+            m_objectReferences.append({ m_buffer.size(), i, static_cast<uint32_t>(m_objectPool.size()) });
         writeConstantPoolIndex(m_objectPool, i);
+    }
+
+    // Buffer identities are known only after the real walk: Error metadata and
+    // ordinary getters can replace values that have not been visited yet. Wrap
+    // those already-written bytes, never visit application objects a second time.
+    // The leading envelope array adds one object-pool slot, so reference indexes
+    // (and their widths at 255/65535 slots) must shift. Strings do not shift.
+    bool finishBufferEnvelope()
+    {
+        if (m_nodeBufferIndices.isEmpty())
+            return false; // Preserve byte-for-byte bare framing, including Errors.
+        if (m_objectPool.size() > std::numeric_limits<uint32_t>::max() - 2) {
+            fail();
+            return false;
+        }
+        Vector<uint8_t> valueBytes = WTF::move(m_buffer);
+        m_buffer = {};
+        write(CurrentVersion);
+        write(ArrayTag);
+        write(static_cast<uint32_t>(2));
+        write(static_cast<uint32_t>(0));
+        size_t cursor = sizeof(CurrentVersion);
+        auto indexWidth = [](uint32_t count) -> size_t {
+            return count <= 0xFF ? 1 : count <= 0xFFFF ? 2
+                                                       : 4;
+        };
+        auto writeIndex = [&](uint32_t count, uint32_t index) {
+            if (count <= 0xFF)
+                write(static_cast<uint8_t>(index));
+            else if (count <= 0xFFFF)
+                write(static_cast<uint16_t>(index));
+            else
+                write(index);
+        };
+        for (const auto& reference : m_objectReferences) {
+            write(valueBytes.data() + cursor, reference.offset - cursor);
+            if (m_failed)
+                return false;
+            writeIndex(reference.poolSize + 1, reference.index + 1);
+            cursor = reference.offset + indexWidth(reference.poolSize);
+        }
+        write(valueBytes.data() + cursor, valueBytes.size() - cursor);
+        if (m_failed)
+            return false;
+        write(static_cast<uint32_t>(1));
+        write(ArrayTag);
+        write(static_cast<uint32_t>(m_nodeBufferIndices.size()));
+        uint32_t index = 0;
+        for (auto bufferIndex : m_nodeBufferIndices) {
+            write(index++);
+            write(ObjectReferenceTag);
+            writeIndex(m_objectPool.size() + 2, bufferIndex + 1);
+        }
+        write(TerminatorTag);
+        write(TerminatorTag);
+        return true;
     }
 
     template<class T> void writeConstantPoolIndex(const T& constantPool, unsigned i)
@@ -2004,6 +2091,13 @@ private:
         }
     }
 #endif
+    struct ObjectReference {
+        size_t offset;
+        uint32_t index;
+        uint32_t poolSize;
+    };
+    Vector<ObjectReference> m_objectReferences;
+    Vector<uint32_t> m_nodeBufferIndices;
     ObjectPool m_objectPool;
     ObjectPool m_transferredMessagePorts;
     ObjectPool m_transferredArrayBuffers;
@@ -2019,6 +2113,7 @@ private:
 #endif
     SerializationForStorage m_forStorage;
     SerializationForCrossProcessTransfer m_forTransfer;
+    bool m_preserveNodeBuffers;
 };
 
 SYSV_ABI void SerializedScriptValue::writeBytesForBun(CloneSerializer* ctx, const uint8_t* data, uint32_t size)
@@ -4559,6 +4654,13 @@ static bool isObjectFastPathCandidate(Structure* structure)
     return true;
 }
 
+ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::createForNode(JSGlobalObject& globalObject, JSValue value, SerializationForStorage forStorage, SerializationForCrossProcessTransfer forTransfer, bool& hasBufferEnvelope)
+{
+    Vector<RefPtr<MessagePort>> ports;
+    hasBufferEnvelope = false;
+    return create(globalObject, value, {}, ports, forStorage, SerializationErrorMode::Throwing, SerializationContext::Default, forTransfer, &hasBufferEnvelope);
+}
+
 RefPtr<SerializedScriptValue> SerializedScriptValue::create(JSC::JSGlobalObject& globalObject, JSC::JSValue value, SerializationForStorage forStorage, SerializationErrorMode throwExceptions, SerializationContext serializationContext, SerializationForCrossProcessTransfer forTransfer)
 {
     Vector<RefPtr<MessagePort>> dummyPorts;
@@ -4573,13 +4675,13 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalOb
     return create(globalObject, value, WTF::move(transferList), messagePorts, forStorage, SerializationErrorMode::Throwing, serializationContext, forTransfer);
 }
 
-ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalObject& lexicalGlobalObject, JSValue value, Vector<JSC::Strong<JSC::JSObject>>&& transferList, Vector<RefPtr<MessagePort>>& messagePorts, SerializationForStorage forStorage, SerializationErrorMode throwExceptions, SerializationContext context, SerializationForCrossProcessTransfer forTransfer)
+ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalObject& lexicalGlobalObject, JSValue value, Vector<JSC::Strong<JSC::JSObject>>&& transferList, Vector<RefPtr<MessagePort>>& messagePorts, SerializationForStorage forStorage, SerializationErrorMode throwExceptions, SerializationContext context, SerializationForCrossProcessTransfer forTransfer, bool* hasBufferEnvelope)
 {
     VM& vm = lexicalGlobalObject.vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
 
     // Fast path optimization: for postMessage/structuredClone with pure strings and no transfers
-    const bool canUseFastPath = (context == SerializationContext::WorkerPostMessage || context == SerializationContext::WindowPostMessage || context == SerializationContext::Default)
+    const bool canUseFastPath = !hasBufferEnvelope && (context == SerializationContext::WorkerPostMessage || context == SerializationContext::WindowPostMessage || context == SerializationContext::Default)
         && forStorage == SerializationForStorage::No
         && forTransfer == SerializationForCrossProcessTransfer::No
         && transferList.isEmpty()
@@ -4861,7 +4963,7 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalOb
         wasmModules,
         wasmMemoryHandles,
 #endif
-        buffer, context, *sharedBuffers, serializedBlockListRefs, forStorage, forTransfer);
+        buffer, context, *sharedBuffers, serializedBlockListRefs, forStorage, forTransfer, hasBufferEnvelope);
 
     auto releaseSerializedBlockListRefs = [&] {
         for (auto* ptr : serializedBlockListRefs)

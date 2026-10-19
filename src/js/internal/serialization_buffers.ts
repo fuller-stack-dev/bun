@@ -1,59 +1,10 @@
-// Buffer tagging for JSC-serialized transports (advanced IPC, node:v8). JSC has no host-object hook,
-// so we ship a [value, buffers] envelope (identity-aliased) and restore Buffer prototypes on receive.
-// Node ref: https://github.com/nodejs/node/blob/main/lib/internal/child_process/serialization.js
+// Node transport envelopes are collected by the native serialization walk.
+// The aliased Buffer views are restored only after the envelope is decoded.
 
 const { Buffer } = require("node:buffer");
-const { isNativeError, isUint8Array } = require("node:util/types");
+const { isUint8Array } = require("node:util/types");
 const BufferPrototype = Buffer.prototype;
-const isBuffer = Buffer.isBuffer;
-const ObjectKeys = Object.keys;
-const ObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const ObjectSetPrototypeOf = Object.setPrototypeOf;
-const ObjectPrototypeHasOwnProperty = Object.prototype.hasOwnProperty;
-const SafeSet = Set;
-
-/** Returns null when `value` holds no Buffers, else the [value, buffers] envelope. */
-function tagBuffers(value: unknown): [unknown, unknown[]] | null {
-  let buffers: unknown[] | null = null;
-  let visited: Set<object> | null = null;
-  const stack = [value];
-  while (stack.length !== 0) {
-    const current = stack[stack.length - 1];
-    stack.length--;
-    if (current === null || typeof current !== "object") continue;
-    visited ??= new SafeSet();
-    if (visited.$has(current)) continue;
-    visited.$add(current);
-    if ($isTypedArrayView(current)) {
-      if (isBuffer(current)) $arrayPush((buffers ??= []), current);
-      // Other ArrayBuffer views round-trip with their type already.
-      continue;
-    }
-    if ($isMap(current)) {
-      current.$forEach((entry, key) => {
-        $arrayPush(stack, key);
-        $arrayPush(stack, entry);
-      });
-      continue;
-    }
-    if ($isSet(current)) {
-      current.$forEach(entry => $arrayPush(stack, entry));
-      continue;
-    }
-    // Error causes are usually non-enumerable, but are part of the serialized graph.
-    if (isNativeError(current)) {
-      const cause = ObjectGetOwnPropertyDescriptor(current, "cause");
-      if (cause && ObjectPrototypeHasOwnProperty.$call(cause, "value")) $arrayPush(stack, cause.value);
-    }
-    // Only data properties are descended so no getter runs here.
-    const keys = ObjectKeys(current);
-    for (let i = 0; i < keys.length; i++) {
-      const desc = ObjectGetOwnPropertyDescriptor(current, keys[i]);
-      if (desc && ObjectPrototypeHasOwnProperty.$call(desc, "value")) $arrayPush(stack, desc.value);
-    }
-  }
-  return buffers === null ? null : [value, buffers];
-}
 
 /**
  * Receive side: restore the Buffer prototype on the envelope's aliased views
@@ -75,4 +26,4 @@ function restoreBuffers(envelope: unknown): unknown {
   return (envelope as unknown[])[0];
 }
 
-export default { tagBuffers, restoreBuffers };
+export default { restoreBuffers };

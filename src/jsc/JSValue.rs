@@ -2220,6 +2220,7 @@ pub enum TemporalType {
 pub struct SerializedFlags {
     pub for_cross_process_transfer: bool,
     pub for_storage: bool,
+    pub preserve_node_buffers: bool,
 }
 
 /// `JSValue.SerializedScriptValue` — owned view over a
@@ -2228,8 +2229,13 @@ pub struct SerializedScriptValue {
     bytes: *const u8,
     size: usize,
     handle: *mut c_void,
+    has_buffer_envelope: bool,
 }
 impl SerializedScriptValue {
+    pub fn has_buffer_envelope(&self) -> bool {
+        self.has_buffer_envelope
+    }
+
     /// Borrow the serialized bytes. Valid only while `self` is alive (the
     /// backing buffer is freed on drop); the lifetime is tied to `&self`.
     #[inline]
@@ -2252,6 +2258,7 @@ struct SerializedScriptValueExternal {
     bytes: *const u8,
     size: usize,
     handle: *mut c_void,
+    has_buffer_envelope: bool,
 }
 
 /// Callback signature for [`JSValue::for_each`] / [`JSValue::for_each_with_context`].
@@ -2720,6 +2727,9 @@ impl JSValue {
         if flags.for_storage {
             bits |= 1 << 1;
         }
+        if flags.preserve_node_buffers {
+            bits |= 1 << 2;
+        }
         let ext = host_fn::from_js_host_call_generic(global, || {
             Bun__serializeJSValue(global, self, bits)
         })?;
@@ -2730,6 +2740,7 @@ impl JSValue {
             bytes: ext.bytes,
             size: ext.size,
             handle: ext.handle,
+            has_buffer_envelope: ext.has_buffer_envelope,
         })
     }
 }

@@ -101,20 +101,7 @@ export function parseHandle(target, serialized, fd) {
 }
 
 /**
- * Advanced-mode IPC Buffer tagging; the mechanism lives in
- * internal/serialization_buffers (shared with node:v8 serialize/deserialize).
- * Returns null when the message holds no Buffers so the caller keeps the bare
- * wire format (and its zero-walk ack fast paths).
- *
- * @param {unknown} message
- * @returns {[unknown, unknown[]] | null}
- */
-export function tagAdvancedBuffers(message) {
-  return require("internal/serialization_buffers").tagBuffers(message);
-}
-
-/**
- * Receive side of tagAdvancedBuffers.
+ * Restore the Buffer identities collected by native advanced IPC serialization.
  *
  * @param {unknown} envelope
  * @returns {unknown}

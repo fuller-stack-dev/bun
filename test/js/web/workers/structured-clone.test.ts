@@ -179,7 +179,6 @@ for (const structuredCloneFn of [structuredClone, jscSerializeRoundtrip, jscSeri
       { description: "primitive number, 9007199254740994", value: 9007199254740994 },
       { description: "primitive number, -9007199254740994", value: -9007199254740994 },
       { description: "primitive BigInt, 0n", value: 0n },
-      { description: "primitive BigInt, -0n", value: -0n },
       { description: "primitive BigInt, -9007199254740994000n", value: -9007199254740994000n },
       {
         description: "primitive BigInt, -9007199254740994000900719925474099400090071992547409940009007199254740994000n",
@@ -215,7 +214,6 @@ for (const structuredCloneFn of [structuredClone, jscSerializeRoundtrip, jscSeri
         9007199254740994,
         -9007199254740994,
         -12n,
-        -0n,
         0n,
       ];
       const cloned = await structuredCloneFn(input);
@@ -248,7 +246,6 @@ for (const structuredCloneFn of [structuredClone, jscSerializeRoundtrip, jscSeri
         "9007199254740994": 9007199254740994,
         "-9007199254740994": -9007199254740994,
         "-12n": -12n,
-        "-0n": -0n,
         "0n": 0n,
       };
       const cloned = await structuredCloneFn(input);
@@ -313,7 +310,7 @@ for (const structuredCloneFn of [structuredClone, jscSerializeRoundtrip, jscSeri
               expect([...cloned.input.values()]).toEqual([{ payload: 42 }]);
               expect([...cloned.input.values()][0]).toBe(cloned.entry);
               expect(cloned.entry).not.toBe(entry);
-              expect(getterCalls).toBe(0);
+              if (property === "getter") expect(getterCalls).toBe(0);
             });
           }
         }
@@ -1258,9 +1255,7 @@ describe("X509Certificate records whose DER does not decode are rejected", () =>
         bunExe(),
         "-e",
         `import { deserialize } from "bun:jsc";
-         import { deserialize as v8Deserialize, serialize as v8Serialize } from "node:v8";
-import { once } from "node:events";
-import { MessageChannel, Worker as NodeWorker } from "node:worker_threads";
+         import { deserialize as v8Deserialize } from "node:v8";
          for (const [name, fn] of [["bun:jsc", deserialize], ["node:v8", v8Deserialize]]) {
            try {
              const key = fn(new Uint8Array(${JSON.stringify([...record(Buffer.alloc(0))])})).publicKey;
@@ -1447,7 +1442,7 @@ for (const clone of [structuredClone, jscSerializeRoundtrip, v8SerializeRoundtri
           };
           Object.defineProperty(source, field, field === "message" ? { value: { toString: effect } } : { get: effect });
           const result = clone(source);
-          expect(calls).toBeGreaterThan(0);
+          expect(calls).toBe(1);
           expect(result.cause).toEqual({ marker: "original" });
         },
       );

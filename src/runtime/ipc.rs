@@ -389,26 +389,22 @@ mod advanced {
     ) -> Result<usize, IPCSerializationError> {
         // Internal (control) messages never carry user Buffers, and the
         // hardcoded ack/nack packets depend on their bare wire shape.
-        let (value, message_type) = match is_internal {
-            IsInternal::Internal => (value, IPCMessageType::SerializedInternalMessage),
-            IsInternal::External => {
-                let tagged = ipc_tag_advanced_buffers(global, value)?;
-                if tagged.is_null() {
-                    (value, IPCMessageType::SerializedMessage)
-                } else {
-                    (tagged, IPCMessageType::SerializedMessageWithBuffers)
-                }
-            }
-        };
-
         let serialized = value.serialize(
             global,
             SerializedFlags {
-                // IPC sends across process.
+                // IPC sends across process. Internal ACK/NACK messages stay bare.
                 for_cross_process_transfer: true,
                 for_storage: false,
+                preserve_node_buffers: matches!(is_internal, IsInternal::External),
             },
         )?;
+        let message_type = match is_internal {
+            IsInternal::Internal => IPCMessageType::SerializedInternalMessage,
+            IsInternal::External if serialized.has_buffer_envelope() => {
+                IPCMessageType::SerializedMessageWithBuffers
+            }
+            IsInternal::External => IPCMessageType::SerializedMessage,
+        };
         // `serialized` Drops at scope exit (defer serialized.deinit()).
 
         let size: u32 = u32::try_from(serialized.data().len()).expect("int cast");
@@ -2626,16 +2622,6 @@ pub(crate) fn ipc_serialize(
 ) -> JsResult<JSValue> {
     // `[[ZIG_EXPORT(zero_is_throw)]]`
     bun_jsc::cpp::IPCSerialize(global_object, message, handle, options)
-}
-
-#[track_caller]
-pub(crate) fn ipc_tag_advanced_buffers(
-    global_object: &JSGlobalObject,
-    message: JSValue,
-) -> JsResult<JSValue> {
-    // `[[ZIG_EXPORT(zero_is_throw)]]`; returns null when the message holds no
-    // Buffers, else the `[message, buffers]` envelope (see Ipc.ts).
-    bun_jsc::cpp::IPCTagAdvancedBuffers(global_object, message)
 }
 
 #[track_caller]
