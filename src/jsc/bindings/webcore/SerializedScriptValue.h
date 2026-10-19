@@ -88,7 +88,8 @@ enum class SerializationErrorMode { NonThrowing,
     Throwing };
 enum class SerializationContext { Default,
     WorkerPostMessage,
-    WindowPostMessage };
+    WindowPostMessage,
+    WorkerError };
 enum class SerializationForStorage : bool { No,
     Yes };
 enum class SerializationForCrossProcessTransfer : bool { No,

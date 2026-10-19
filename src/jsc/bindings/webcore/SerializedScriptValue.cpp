@@ -1173,6 +1173,11 @@ private:
         write(column);
         writeNullableString(sourceURL);
         writeNullableString(stack);
+        // Worker error events carry causes through their own bounded, best-effort metadata owner.
+        if (m_context == SerializationContext::WorkerError) {
+            write(static_cast<uint8_t>(0));
+            return JSValue();
+        }
         JSC::PropertyDescriptor cause;
         bool found = errorInstance->getOwnPropertyDescriptor(m_lexicalGlobalObject, vm.propertyNames->cause, cause);
         RETURN_IF_EXCEPTION(scope, JSValue());

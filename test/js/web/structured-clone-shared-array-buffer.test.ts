@@ -1,6 +1,6 @@
-import { serialize as jscSerialize } from "bun:jsc";
+import { deserialize as jscDeserialize, serialize as jscSerialize } from "bun:jsc";
 import { describe, expect, test } from "bun:test";
-import { serialize as v8Serialize } from "node:v8";
+import { deserialize as v8Deserialize, serialize as v8Serialize } from "node:v8";
 
 // structuredClone stays inside the agent cluster, so SharedArrayBuffers share
 // their backing store like node and the HTML spec's StructuredSerialize.
@@ -75,10 +75,23 @@ describe("Error.cause SharedArrayBuffer graph", () => {
     expect([...new Uint8Array(buffer)]).toEqual([42, 0, 0, 0]);
   });
 
-  for (const serialize of [jscSerialize, v8Serialize]) {
-    test("storage serialization rejects shared memory hidden in a cause: " + serialize.name, () => {
-      const source = new Error("storage", { cause: new Uint8Array(new SharedArrayBuffer(4)) });
-      expect(() => serialize(source)).toThrow(expect.objectContaining({ name: "DataCloneError" }));
+  for (const [name, serialize, deserialize] of [
+    ["bun:jsc", jscSerialize, jscDeserialize],
+    ["node:v8", v8Serialize, v8Deserialize],
+  ] as const) {
+    test("storage serialization copies shared causes into private buffers: " + name, () => {
+      const buffer = new SharedArrayBuffer(4);
+      const view = new Uint8Array(buffer);
+      view[0] = 42;
+      const result = deserialize(serialize(new Error("storage", { cause: { buffer, view } })));
+      expect(result.cause.buffer).toBeInstanceOf(ArrayBuffer);
+      expect(result.cause.buffer).not.toBeInstanceOf(SharedArrayBuffer);
+      expect(result.cause.view.buffer).toBe(result.cause.buffer);
+      expect([...result.cause.view]).toEqual([42, 0, 0, 0]);
+      view[0] = 7;
+      expect(result.cause.view[0]).toBe(42);
+      result.cause.view[1] = 9;
+      expect(view[1]).toBe(0);
     });
   }
 
