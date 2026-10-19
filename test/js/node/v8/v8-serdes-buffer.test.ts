@@ -138,19 +138,22 @@ describe("v8 serialize/deserialize Buffer identity", () => {
     expect(v8.deserialize(bare)).toEqual({ buf: new Uint8Array([7]) });
   });
 
-  test.each([249, 250, 251, 252, 65529, 65530, 65531, 65532])("Buffer envelope retains aliases across %i values", count => {
-    const buffer = Buffer.from("slots");
-    const values = Array.from({ length: count }, (_, index) => ({ index }));
-    const input: any = { values, buffer, again: buffer, first: values[0], last: values.at(-1) };
-    input.self = input;
-    const out = v8.deserialize(v8.serialize(input));
-    expect(out.self).toBe(out);
-    expect(out.first).toBe(out.values[0]);
-    expect(out.last).toBe(out.values.at(-1));
-    expect(out.buffer).toBe(out.again);
-    expect(Buffer.isBuffer(out.buffer)).toBe(true);
-    expect(out.buffer.toString()).toBe("slots");
-  });
+  test.each([249, 250, 251, 252, 65529, 65530, 65531, 65532])(
+    "Buffer envelope retains aliases across %i values",
+    count => {
+      const buffer = Buffer.from("slots");
+      const values = Array.from({ length: count }, (_, index) => ({ index }));
+      const input: any = { values, buffer, again: buffer, first: values[0], last: values.at(-1) };
+      input.self = input;
+      const out = v8.deserialize(v8.serialize(input));
+      expect(out.self).toBe(out);
+      expect(out.first).toBe(out.values[0]);
+      expect(out.last).toBe(out.values.at(-1));
+      expect(out.buffer).toBe(out.again);
+      expect(Buffer.isBuffer(out.buffer)).toBe(true);
+      expect(out.buffer.toString()).toBe("slots");
+    },
+  );
 
   test("Buffer-free Error graphs retain byte-for-byte bare framing", () => {
     const jsc = require("bun:jsc");
@@ -185,15 +188,15 @@ describe("v8 serialize/deserialize Buffer identity", () => {
 
   test("advanced IPC tags Buffers introduced by earlier Error metadata", async () => {
     const source = [
-      'let calls = 0;',
+      "let calls = 0;",
       'for (const initial of ["buffer", "absent"]) for (const field of ["name", "message", "stack"]) {',
       ' const later = initial === "buffer" ? new Error("later", { cause: Buffer.from("old") }) : new Error("later");',
       ' const first = new Error("first"); first.stack = "";',
       ' const effect = () => { calls++; const b = Buffer.from("new"); later.cause = new Map([[b, b]]); return field === "name" ? "Error" : "metadata"; };',
       ' Object.defineProperty(first, field, field === "message" ? { value: { toString: effect } } : { get: effect });',
-      ' process.send([first, later, later]);',
-      '}',
-      'process.send({ done: true, calls });',
+      " process.send([first, later, later]);",
+      "}",
+      "process.send({ done: true, calls });",
       'process.on("message", () => {});',
     ].join("\n");
     const { promise, resolve, reject } = Promise.withResolvers<void>();
