@@ -1432,6 +1432,55 @@ for (const clone of [structuredClone, jscSerializeRoundtrip, v8SerializeRoundtri
       expect(result.cause.cause).toEqual({ code: 42 });
     });
 
+    for (const field of ["name", "message", "stack"]) {
+      test.each(["replace", "delete", "uncloneable"])(
+        "cause snapshot precedes " + field + " metadata effects: %s",
+        mutation => {
+          const source = new Error("outer", { cause: { marker: "original" } });
+          source.stack = "";
+          let calls = 0;
+          const effect = () => {
+            calls++;
+            if (mutation === "delete") delete source.cause;
+            else source.cause = mutation === "replace" ? { marker: "replacement" } : () => {};
+            return field === "name" ? "Error" : "metadata";
+          };
+          Object.defineProperty(source, field, field === "message" ? { value: { toString: effect } } : { get: effect });
+          const result = clone(source);
+          expect(calls).toBeGreaterThan(0);
+          expect(result.cause).toEqual({ marker: "original" });
+        },
+      );
+    }
+
+    test("cause snapshot stays rooted across metadata deletion and early collection", () => {
+      const source = new Error("outer");
+      source.cause = { error: source, bytes: new Uint8Array([17, 42]) };
+      Object.defineProperty(source, "stack", {
+        get() {
+          delete source.cause;
+          Bun.gc(true);
+          return "";
+        },
+      });
+      const result = clone(source);
+      expect(Object.hasOwn(source, "cause")).toBe(false);
+      expect(result.cause.error).toBe(result);
+      expect(result.cause.bytes).toEqual(new Uint8Array([17, 42]));
+    });
+
+    test("cause snapshot rejects an original uncloneable value removed by metadata", () => {
+      const source = new Error("outer", { cause: () => {} });
+      Object.defineProperty(source, "stack", {
+        get() {
+          source.cause = "replacement";
+          return "";
+        },
+      });
+      expect(() => clone(source)).toThrow(expect.objectContaining({ name: "DataCloneError" }));
+      expect(source.cause).toBe("replacement");
+    });
+
     test("self, mutual and container cycles preserve object identity", () => {
       const self = new Error("self");
       self.cause = self;

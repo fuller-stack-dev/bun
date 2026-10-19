@@ -4,7 +4,7 @@ import v8 from "node:v8";
 
 // Buffer identity through v8.serialize/deserialize, matching node v26.3.0's
 // serializer delegate behavior (DefaultSerializer host objects). Non-Buffer
-// payloads keep the bare JSC-serialized format for backward compatibility.
+// payloads keep bare JSC framing instead of the Buffer envelope.
 describe("v8 serialize/deserialize Buffer identity", () => {
   test.each([new Uint8Array([1, 2]), Buffer.from([1, 2])])("serialized output is transferable: %p", input => {
     const serialized = v8.serialize(input);
@@ -62,6 +62,23 @@ describe("v8 serialize/deserialize Buffer identity", () => {
     expect(key.toString()).toBe("aus");
   });
 
+  test.each(["name", "message", "stack"])("cause snapshot retains Buffer brand and bytes before %s effects", field => {
+    const source = new Error("outer", { cause: Buffer.from("original").subarray(1, 5) });
+    source.stack = "";
+    let calls = 0;
+    const effect = () => {
+      calls++;
+      source.cause = Buffer.from("replacement");
+      return field === "name" ? "Error" : "metadata";
+    };
+    Object.defineProperty(source, field, field === "message" ? { value: { toString: effect } } : { get: effect });
+    const out = v8.deserialize(v8.serialize(source));
+    expect(calls).toBeGreaterThan(0);
+    expect(Buffer.isBuffer(out.cause)).toBe(true);
+    expect(out.cause.toString()).toBe("rigi");
+    expect(out.cause.length).toBe(4);
+  });
+
   test("Error.cause Buffer scanning terminates on Error cycles without invoking accessors", () => {
     const error = new Error("outer");
     const nested = new Error("inner", { cause: error });
@@ -82,14 +99,14 @@ describe("v8 serialize/deserialize Buffer identity", () => {
     expect(reads).toBe(0);
   });
 
-  test("Buffer-free payloads keep the bare format (old readers still work)", () => {
+  test("Buffer-free payloads keep bare JSC framing in the current runtime", () => {
     const jsc = require("bun:jsc");
     const bytes = v8.serialize({ n: 1, s: "x" });
     // Bare JSC bytes deserialize directly — no envelope framing present.
     expect(jsc.deserialize(bytes)).toEqual({ n: 1, s: "x" });
-    // And deserialize accepts pre-envelope output produced by jsc.serialize.
-    const legacy = jsc.serialize({ buf: new Uint8Array([7]) }, { binaryType: "nodebuffer" });
-    expect(v8.deserialize(legacy)).toEqual({ buf: new Uint8Array([7]) });
+    // deserialize also accepts current bare output from jsc.serialize.
+    const bare = jsc.serialize({ buf: new Uint8Array([7]) }, { binaryType: "nodebuffer" });
+    expect(v8.deserialize(bare)).toEqual({ buf: new Uint8Array([7]) });
   });
 
   test("rejects an envelope whose buffer list holds a non-Uint8Array view", () => {

@@ -1105,6 +1105,20 @@ private:
     {
         auto& vm = m_lexicalGlobalObject->vm();
         auto scope = DECLARE_THROW_SCOPE(vm);
+        JSValue cause;
+        bool hasCause = false;
+        // Snapshot and root before metadata getters/coercions can replace the cause or collect it.
+        // Worker error events retain their separate bounded, best-effort metadata owner.
+        if (m_context != SerializationContext::WorkerError) {
+            JSC::PropertyDescriptor descriptor;
+            bool found = errorInstance->getOwnPropertyDescriptor(m_lexicalGlobalObject, vm.propertyNames->cause, descriptor);
+            RETURN_IF_EXCEPTION(scope, JSValue());
+            hasCause = found && descriptor.isDataDescriptor();
+            if (hasCause) {
+                cause = descriptor.value();
+                m_gcBuffer.appendWithCrashOnOverflow(cause);
+            }
+        }
         auto errorTypeValue = errorInstance->get(m_lexicalGlobalObject, vm.propertyNames->name);
         RETURN_IF_EXCEPTION(scope, JSValue());
         auto errorTypeString = errorTypeValue.toWTFString(m_lexicalGlobalObject);
@@ -1173,17 +1187,8 @@ private:
         write(column);
         writeNullableString(sourceURL);
         writeNullableString(stack);
-        // Worker error events carry causes through their own bounded, best-effort metadata owner.
-        if (m_context == SerializationContext::WorkerError) {
-            write(static_cast<uint8_t>(0));
-            return JSValue();
-        }
-        JSC::PropertyDescriptor cause;
-        bool found = errorInstance->getOwnPropertyDescriptor(m_lexicalGlobalObject, vm.propertyNames->cause, cause);
-        RETURN_IF_EXCEPTION(scope, JSValue());
-        bool hasCause = found && cause.isDataDescriptor();
         write(static_cast<uint8_t>(hasCause));
-        return hasCause ? cause.value() : JSValue();
+        return cause;
     }
 
     bool dumpIfTerminal(JSValue value, SerializationReturnCode& code)
@@ -2255,7 +2260,6 @@ SerializationReturnCode CloneSerializer::serialize(JSValue in)
                     break;
                 // Keep the Error in the same pool before traversing its cause, including self references.
                 inputObjectStack.append(error);
-                m_gcBuffer.appendWithCrashOnOverflow(cause);
                 inValue = cause;
                 stateStack.append(ErrorEndVisitCause);
                 goto stateUnknown;
