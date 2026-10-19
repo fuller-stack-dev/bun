@@ -186,6 +186,98 @@ describe("v8 serialize/deserialize Buffer identity", () => {
     expect(Reflect.ownKeys(out.ignored)).toEqual([]);
   });
 
+  for (const transport of ["v8", "structuredClone", "advanced IPC"]) {
+    test.each(["benign", "throwing", "cyclic", "Buffer", "subclass", "intermediate"])(
+      `${transport} classifies %s typed arrays without prototype callbacks`,
+      async kind => {
+        // A subprocess bounds synchronous native hangs and crashes; a test-runner
+        // timeout alone cannot interrupt a stuck serializer on its own thread.
+        const source = `
+          const { serialize, deserialize } = require("node:v8");
+          const kind = ${JSON.stringify(kind)};
+          const transport = ${JSON.stringify(transport)};
+          let traps = 0, reads = 0;
+          let value;
+          if (["Buffer", "subclass", "intermediate"].includes(kind)) {
+            value = Buffer.from([7, 8]);
+            if (kind === "subclass") {
+              class Derived extends Buffer {}
+              Object.setPrototypeOf(value, Derived.prototype);
+            } else if (kind === "intermediate") {
+              Object.setPrototypeOf(value, Object.create(Buffer.prototype));
+            }
+          } else {
+            value = new Uint8Array([7, 8]);
+            const prototype = new Proxy(Uint8Array.prototype, {
+              getPrototypeOf(target) {
+                traps++;
+                if (kind === "throwing") throw new Error("must not inspect prototype");
+                if (kind === "cyclic") return prototype;
+                return Reflect.getPrototypeOf(target);
+              }
+            });
+            Object.setPrototypeOf(value, prototype);
+          }
+          const input = { get value() { reads++; return value; }, alias: value };
+          input.self = input;
+          if (transport === "advanced IPC") {
+            process.on("message", () => process.disconnect());
+            process.send(input);
+            console.log(JSON.stringify({ traps, reads }));
+          } else {
+            const out = transport === "v8" ? deserialize(serialize(input)) : structuredClone(input);
+            console.log(JSON.stringify({
+              traps, reads, bytes: Array.from(out.value), buffer: Buffer.isBuffer(out.value),
+              alias: out.value === out.alias, cycle: out.self === out
+            }));
+          }
+        `;
+        let received: any;
+        const proc = Bun.spawn({
+          cmd: [bunExe(), "-e", source],
+          env: bunEnv,
+          stdout: "pipe",
+          stderr: "pipe",
+          ...(transport === "advanced IPC"
+            ? {
+                serialization: "advanced" as const,
+                ipc(message: any, child: Bun.Subprocess) {
+                  received = message;
+                  child.send("received");
+                },
+              }
+            : {}),
+        });
+        let timedOut = false;
+        const timeout = setTimeout(() => {
+          timedOut = true;
+          proc.kill(9);
+        }, 10_000);
+        try {
+          const [stdout, stderr, code] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(timedOut).toBe(false);
+          expect(code).toBe(0);
+          expect(proc.signalCode).toBeNull();
+          expect(stderr).toBe("");
+          const result = JSON.parse(stdout);
+          expect(result.traps).toBe(0);
+          expect(result.reads).toBe(1);
+          const out = transport === "advanced IPC" ? received : result;
+          const isBuffer = ["Buffer", "subclass", "intermediate"].includes(kind) && transport !== "structuredClone";
+          expect(transport === "advanced IPC" ? Array.from(out.value) : out.bytes).toEqual([7, 8]);
+          expect(transport === "advanced IPC" ? Buffer.isBuffer(out.value) : out.buffer).toBe(isBuffer);
+          expect(transport === "advanced IPC" ? out.value === out.alias : out.alias).toBe(true);
+          expect(transport === "advanced IPC" ? out.self === out : out.cycle).toBe(true);
+        } finally {
+          clearTimeout(timeout);
+          if (proc.exitCode === null) proc.kill(9);
+          await proc.exited;
+        }
+      },
+      20_000,
+    );
+  }
+
   test("advanced IPC tags Buffers introduced by earlier Error metadata", async () => {
     const source = [
       "let calls = 0;",

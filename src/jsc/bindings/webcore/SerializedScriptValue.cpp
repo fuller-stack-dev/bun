@@ -1036,16 +1036,15 @@ private:
     {
         if (!object->inherits<JSUint8Array>())
             return false;
-        auto& vm = m_lexicalGlobalObject->vm();
-        auto scope = DECLARE_THROW_SCOPE(vm);
         auto prototype = defaultGlobalObject(m_lexicalGlobalObject)->JSBufferSubclassStructure()->storedPrototype();
-        for (JSValue current = object->getPrototype(m_lexicalGlobalObject); current.isObject();) {
-            RETURN_IF_EXCEPTION(scope, false);
+        // Inspect engine-stored prototypes, as queryObjects does. [[GetPrototypeOf]]
+        // would execute Proxy traps while serializing an otherwise ordinary view.
+        // Direct traversal retains Buffer subclasses and intermediate prototypes
+        // without following an exotic object's user-defined prototype chain.
+        for (JSValue current = object->getPrototypeDirect(); current.isObject(); current = asObject(current)->getPrototypeDirect()) {
             if (current == prototype)
                 return true;
-            current = asObject(current)->getPrototype(m_lexicalGlobalObject);
         }
-        RETURN_IF_EXCEPTION(scope, false);
         return false;
     }
 
