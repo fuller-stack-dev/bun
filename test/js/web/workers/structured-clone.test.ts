@@ -1404,3 +1404,189 @@ describe("Map/Set own properties across message and storage boundaries", () => {
     expect(await proc.stderr.text()).toBe("");
   });
 });
+
+function v8SerializeRoundtrip(value: any) {
+  return v8Deserialize(v8Serialize(value));
+}
+
+for (const clone of [structuredClone, jscSerializeRoundtrip, v8SerializeRoundtrip]) {
+  describe("Error.cause graph serialization: " + clone.name, () => {
+    test.each([undefined, null, false, 0, -0, NaN, Infinity, "", "cause", 42n])("own data cause %p", cause => {
+      const result = clone(new Error("outer", { cause }));
+      expect(result).toBeInstanceOf(Error);
+      expect(result.message).toBe("outer");
+      expect(Object.getOwnPropertyDescriptor(result, "cause")).toEqual({
+        value: cause,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+    });
+
+    test("nested errors preserve their type, message and cause", () => {
+      const result = clone(new TypeError("outer", { cause: new RangeError("inner", { cause: { code: 42 } }) }));
+      expect(result).toBeInstanceOf(TypeError);
+      expect(result.message).toBe("outer");
+      expect(result.cause).toBeInstanceOf(RangeError);
+      expect(result.cause.message).toBe("inner");
+      expect(result.cause.cause).toEqual({ code: 42 });
+    });
+
+    test("self, mutual and container cycles preserve object identity", () => {
+      const self = new Error("self");
+      self.cause = self;
+      const first = new Error("first");
+      const second = new Error("second", { cause: first });
+      first.cause = second;
+      const container = new Error("container");
+      container.cause = { error: container };
+      const result = clone([self, first, second, container]);
+      expect(result[0].cause).toBe(result[0]);
+      expect(result[1].cause).toBe(result[2]);
+      expect(result[2].cause).toBe(result[1]);
+      expect(result[3].cause.error).toBe(result[3]);
+    });
+
+    test("cause aliases survive reference-pool index width changes", () => {
+      const shared = { marker: "shared" };
+      const errors = Array.from({ length: 300 }, (_, i) => new Error(String(i), { cause: shared }));
+      const result = clone([shared, ...errors, errors[0], shared]);
+      for (let i = 1; i <= errors.length; i++) {
+        expect(result[i]).toBeInstanceOf(Error);
+        expect(result[i].message).toBe(String(i - 1));
+        expect(result[i].cause).toBe(result[0]);
+      }
+      expect(result[301]).toBe(result[1]);
+      expect(result[302]).toBe(result[0]);
+    });
+
+    test("deep causes use the shared iterative graph traversal", () => {
+      let source: Error = new Error("leaf");
+      for (let i = 0; i < 1500; i++) source = new Error(String(i), { cause: source });
+      let result = clone(source);
+      for (let i = 1499; i >= 0; i--) {
+        expect(result.message).toBe(String(i));
+        result = result.cause;
+      }
+      expect(result.message).toBe("leaf");
+      expect(Object.hasOwn(result, "cause")).toBe(false);
+    });
+
+    test("cause traversal stays rooted when a nested getter mutates the source and collects", () => {
+      const source = new Error("outer");
+      source.cause = {
+        get child() {
+          source.cause = undefined;
+          Bun.gc(true);
+          return source;
+        },
+      };
+      const result = clone(source);
+      expect(result.cause.child).toBe(result);
+    });
+
+    test("absent, inherited and accessor causes are omitted without calling getters", () => {
+      const absent = new Error("absent");
+      const inherited = new Error("inherited");
+      const accessor = new Error("accessor");
+      let calls = 0;
+      Object.setPrototypeOf(
+        inherited,
+        Object.create(Error.prototype, {
+          cause: {
+            get() {
+              calls++;
+              throw new Error("inherited getter");
+            },
+          },
+        }),
+      );
+      Object.defineProperty(accessor, "cause", {
+        get() {
+          calls++;
+          throw new Error("own getter");
+        },
+      });
+      const result = clone([absent, inherited, accessor]);
+      expect(result.map((value: Error) => Object.hasOwn(value, "cause"))).toEqual([false, false, false]);
+      expect(calls).toBe(0);
+    });
+
+    test.each([() => {}, Symbol("uncloneable"), new WeakMap()])("rejects uncloneable cause %p", cause => {
+      expect(() => clone(new Error("outer", { cause }))).toThrow(expect.objectContaining({ name: "DataCloneError" }));
+    });
+
+    test("a getter inside a cause propagates the original thrown value", () => {
+      const thrown = new Error("nested getter");
+      const cause = {
+        get value() {
+          throw thrown;
+        },
+      };
+      let caught: unknown;
+      try {
+        clone(new Error("outer", { cause }));
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBe(thrown);
+    });
+  });
+}
+
+test("Error.cause graph serialization survives a fresh process", () => {
+  const error = new TypeError("outer");
+  const shared = { error };
+  error.cause = shared;
+  const result = jscSerializeRoundtripCrossProcessCold([error, shared, error]);
+  expect(result[0]).toBeInstanceOf(TypeError);
+  expect(result[0].message).toBe("outer");
+  expect(result[0].cause).toBe(result[1]);
+  expect(result[1].error).toBe(result[0]);
+  expect(result[2]).toBe(result[0]);
+});
+
+// Captured with format version 14, before Error.cause was part of the wire format.
+const legacyErrorGraph = Buffer.from(
+  "DgAAAAEEAAAAAAAAADcFAAAAAAYAAIBsZWdhY3kBAAAALAAAAAAAAAA5AACAL3ByaXZhdGUvdG1wL3BsdWdpbi1uYXRpdmUtYnVuLXJlcGFpci0yMDI2MTAxOC9idW4vW2V2YWxdAAAAAAAAAIABAAAAEwECAAAAAgEAAIBuBSoAAAD/////AwAAABMC/////w==",
+  "base64",
+);
+
+for (const [name, read] of [
+  ["bun:jsc", deserialize],
+  ["node:v8", v8Deserialize],
+] as const) {
+  test("Error.cause format accepts legacy pooled Error records: " + name, () => {
+    const result = read(legacyErrorGraph);
+    expect(result[0]).toBeInstanceOf(TypeError);
+    expect(result[0].message).toBe("legacy");
+    expect(Object.hasOwn(result[0], "cause")).toBe(false);
+    expect(result[1]).toBe(result[0]);
+    expect(result[2]).toEqual({ n: 42 });
+    expect(result[3]).toBe(result[2]);
+  });
+
+  test("Error.cause format rejects truncated and malformed records: " + name, () => {
+    const error = new Error("wire", { cause: 1 });
+    error.stack = "";
+    const bytes = Buffer.from(serialize(error));
+    expect(bytes.readUInt32LE(0)).toBe(15);
+    expect(read(bytes).cause).toBe(1);
+    for (let end = 4; end < bytes.length; end++) {
+      expect(() => read(bytes.subarray(0, end))).toThrow("Unable to deserialize data.");
+    }
+    // A present cause ends with the presence byte and OneTag for this primitive.
+    expect([...bytes.subarray(-2)]).toEqual([1, 7]);
+    const invalidPresence = Buffer.from(bytes);
+    invalidPresence[invalidPresence.length - 2] = 2;
+    expect(() => read(invalidPresence)).toThrow("Unable to deserialize data.");
+    const invalidTag = Buffer.from(bytes);
+    invalidTag[invalidTag.length - 1] = 255;
+    expect(() => read(invalidTag)).toThrow("Unable to deserialize data.");
+    const invalidReference = Buffer.concat([bytes.subarray(0, -1), Buffer.from([19, 255])]);
+    expect(() => read(invalidReference)).toThrow("Unable to deserialize data.");
+    const future = Buffer.from(bytes);
+    future.writeUInt32LE(16, 0);
+    expect(() => read(future)).toThrow("Unable to deserialize data.");
+  });
+}
