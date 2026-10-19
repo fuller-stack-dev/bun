@@ -1720,13 +1720,13 @@ private:
                 write(index);
         };
         for (const auto& reference : m_objectReferences) {
-            write(valueBytes.data() + cursor, reference.offset - cursor);
+            write(valueBytes.span().data() + cursor, reference.offset - cursor);
             if (m_failed)
                 return false;
             writeIndex(reference.poolSize + 1, reference.index + 1);
             cursor = reference.offset + indexWidth(reference.poolSize);
         }
-        write(valueBytes.data() + cursor, valueBytes.size() - cursor);
+        write(valueBytes.span().data() + cursor, valueBytes.size() - cursor);
         if (m_failed)
             return false;
         write(static_cast<uint32_t>(1));
