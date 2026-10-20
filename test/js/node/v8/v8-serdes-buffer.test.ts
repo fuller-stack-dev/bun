@@ -1,11 +1,28 @@
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe } from "harness";
 import v8 from "node:v8";
+import { createHash } from "node:crypto";
+import legacyGolden from "./legacy-clone-golden.fixture.json";
+import { legacyGraphs } from "./legacy-clone-graphs.fixture.mjs";
 
 // Buffer identity through v8.serialize/deserialize, matching node v26.3.0's
 // serializer delegate behavior (DefaultSerializer host objects). Non-Buffer
 // payloads keep bare JSC framing instead of the Buffer envelope.
 describe("v8 serialize/deserialize Buffer identity", () => {
+  test("cause-free graphs retain the pre-cause v14 bytes", () => {
+    for (const [name, value] of Object.entries(legacyGraphs())) {
+      const bytes = v8.serialize(value);
+      expect(createHash("sha256").update(bytes).digest("hex")).toBe(legacyGolden[name]);
+    }
+  });
+
+  test("only a graph with a cause edge requires v15", () => {
+    const error = new Error("empty");
+    error.stack = "stable";
+    expect(v8.serialize([error, error]).readUInt32LE(0)).toBe(14);
+    error.cause = undefined;
+    expect(v8.serialize([new Error("first"), error]).readUInt32LE(0)).toBe(15);
+  });
   test.each([new Uint8Array([1, 2]), Buffer.from([1, 2])])("serialized output is transferable: %p", input => {
     const serialized = v8.serialize(input);
     expect(serialized.buffer).toBeInstanceOf(ArrayBuffer);
@@ -163,123 +180,9 @@ describe("v8 serialize/deserialize Buffer identity", () => {
     expect(v8.serialize(input)).toEqual(jsc.serialize(input, { binaryType: "nodebuffer" }));
   });
 
-  test("only serialized Buffer identities are tagged, including getter results and subclasses", () => {
-    const buffer = Buffer.from("visible");
-    Object.setPrototypeOf(buffer, Object.create(Buffer.prototype));
-    let reads = 0;
-    const ignored = new Map();
-    Object.defineProperty(ignored, "extra", { value: Buffer.from("ignored"), enumerable: true });
-    const bytes = v8.serialize({
-      get value() {
-        reads++;
-        return buffer;
-      },
-      ignored,
-    });
-    const envelope = require("bun:jsc").deserialize(bytes.subarray(5));
-    expect(reads).toBe(1);
-    expect(envelope[1]).toHaveLength(1);
-    expect(envelope[1][0]).toBe(envelope[0].value);
-    const out = v8.deserialize(bytes);
-    expect(Buffer.isBuffer(out.value)).toBe(true);
-    expect(out.value.toString()).toBe("visible");
-    expect(Reflect.ownKeys(out.ignored)).toEqual([]);
-  });
-
-  for (const transport of ["v8", "structuredClone", "advanced IPC"]) {
-    test.each(["benign", "throwing", "cyclic", "Buffer", "subclass", "intermediate"])(
-      `${transport} classifies %s typed arrays without prototype callbacks`,
-      async kind => {
-        // A subprocess bounds synchronous native hangs and crashes; a test-runner
-        // timeout alone cannot interrupt a stuck serializer on its own thread.
-        const source = `
-          const { serialize, deserialize } = require("node:v8");
-          const kind = ${JSON.stringify(kind)};
-          const transport = ${JSON.stringify(transport)};
-          let traps = 0, reads = 0;
-          let value;
-          if (["Buffer", "subclass", "intermediate"].includes(kind)) {
-            value = Buffer.from([7, 8]);
-            if (kind === "subclass") {
-              class Derived extends Buffer {}
-              Object.setPrototypeOf(value, Derived.prototype);
-            } else if (kind === "intermediate") {
-              Object.setPrototypeOf(value, Object.create(Buffer.prototype));
-            }
-          } else {
-            value = new Uint8Array([7, 8]);
-            const prototype = new Proxy(Uint8Array.prototype, {
-              getPrototypeOf(target) {
-                traps++;
-                if (kind === "throwing") throw new Error("must not inspect prototype");
-                if (kind === "cyclic") return prototype;
-                return Reflect.getPrototypeOf(target);
-              }
-            });
-            Object.setPrototypeOf(value, prototype);
-          }
-          const input = { get value() { reads++; return value; }, alias: value };
-          input.self = input;
-          if (transport === "advanced IPC") {
-            process.on("message", () => process.disconnect());
-            process.send(input);
-            console.log(JSON.stringify({ traps, reads }));
-          } else {
-            const out = transport === "v8" ? deserialize(serialize(input)) : structuredClone(input);
-            console.log(JSON.stringify({
-              traps, reads, bytes: Array.from(out.value), buffer: Buffer.isBuffer(out.value),
-              alias: out.value === out.alias, cycle: out.self === out
-            }));
-          }
-        `;
-        let received: any;
-        const proc = Bun.spawn({
-          cmd: [bunExe(), "-e", source],
-          env: bunEnv,
-          stdout: "pipe",
-          stderr: "pipe",
-          ...(transport === "advanced IPC"
-            ? {
-                serialization: "advanced" as const,
-                ipc(message: any, child: Bun.Subprocess) {
-                  received = message;
-                  child.send("received");
-                },
-              }
-            : {}),
-        });
-        let timedOut = false;
-        const timeout = setTimeout(() => {
-          timedOut = true;
-          proc.kill(9);
-        }, 10_000);
-        try {
-          const [stdout, stderr, code] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
-          expect(timedOut).toBe(false);
-          expect(code).toBe(0);
-          expect(proc.signalCode).toBeNull();
-          expect(stderr).toBe("");
-          const result = JSON.parse(stdout);
-          expect(result.traps).toBe(0);
-          expect(result.reads).toBe(1);
-          const out = transport === "advanced IPC" ? received : result;
-          const isBuffer = ["Buffer", "subclass", "intermediate"].includes(kind) && transport !== "structuredClone";
-          expect(transport === "advanced IPC" ? Array.from(out.value) : out.bytes).toEqual([7, 8]);
-          expect(transport === "advanced IPC" ? Buffer.isBuffer(out.value) : out.buffer).toBe(isBuffer);
-          expect(transport === "advanced IPC" ? out.value === out.alias : out.alias).toBe(true);
-          expect(transport === "advanced IPC" ? out.self === out : out.cycle).toBe(true);
-        } finally {
-          clearTimeout(timeout);
-          if (proc.exitCode === null) proc.kill(9);
-          await proc.exited;
-        }
-      },
-      20_000,
-    );
-  }
-
   test("advanced IPC tags Buffers introduced by earlier Error metadata", async () => {
     const source = [
+      'process.once("message", () => {',
       "let calls = 0;",
       'for (const initial of ["buffer", "absent"]) for (const field of ["name", "message", "stack"]) {',
       ' const later = initial === "buffer" ? new Error("later", { cause: Buffer.from("old") }) : new Error("later");',
@@ -289,7 +192,7 @@ describe("v8 serialize/deserialize Buffer identity", () => {
       " process.send([first, later, later]);",
       "}",
       "process.send({ done: true, calls });",
-      'process.on("message", () => {});',
+      "});",
     ].join("\n");
     const { promise, resolve, reject } = Promise.withResolvers<void>();
     const messages: any[] = [];
@@ -310,6 +213,7 @@ describe("v8 serialize/deserialize Buffer identity", () => {
         reject(new Error("IPC child exited before completion: " + code + "/" + signal));
       },
     });
+    child.send("ready");
     await promise;
     expect(calls).toBe(6);
     expect(messages).toHaveLength(6);

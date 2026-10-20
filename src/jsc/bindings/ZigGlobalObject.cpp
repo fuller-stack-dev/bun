@@ -2668,6 +2668,9 @@ void GlobalObject::finishCreation(VM& vm)
         { OBJECT_OFFSETOF(GlobalObject, m_ipcSerializeFunction), [](const LazyProperty<JSGlobalObject, JSFunction>::Initializer& init) {
              init.set(JSC::JSFunction::create(init.vm, init.owner, WebCore::ipcSerializeCodeGenerator(init.vm), init.owner));
          } },
+        { OBJECT_OFFSETOF(GlobalObject, m_ipcTagAdvancedBuffersFunction), [](const LazyProperty<JSGlobalObject, JSFunction>::Initializer& init) {
+             init.set(JSC::JSFunction::create(init.vm, init.owner, WebCore::ipcTagAdvancedBuffersCodeGenerator(init.vm), init.owner));
+         } },
         { OBJECT_OFFSETOF(GlobalObject, m_ipcRestoreAdvancedBuffersFunction), [](const LazyProperty<JSGlobalObject, JSFunction>::Initializer& init) {
              init.set(JSC::JSFunction::create(init.vm, init.owner, WebCore::ipcRestoreAdvancedBuffersCodeGenerator(init.vm), init.owner));
          } },

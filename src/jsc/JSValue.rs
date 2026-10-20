@@ -2221,6 +2221,7 @@ pub struct SerializedFlags {
     pub for_cross_process_transfer: bool,
     pub for_storage: bool,
     pub preserve_node_buffers: bool,
+    pub omit_error_cause: bool,
 }
 
 /// `JSValue.SerializedScriptValue` — owned view over a
@@ -2729,6 +2730,9 @@ impl JSValue {
         }
         if flags.preserve_node_buffers {
             bits |= 1 << 2;
+        }
+        if flags.omit_error_cause {
+            bits |= 1 << 3;
         }
         let ext = host_fn::from_js_host_call_generic(global, || {
             Bun__serializeJSValue(global, self, bits)

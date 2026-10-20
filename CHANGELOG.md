@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Preserve Error cause graphs in structured cloning and worker messages, while retaining v14 bytes for cause-free values and negotiating cause support for advanced IPC with older Bun processes; thanks fuller-stack-dev.
+
 - Share identical `node:vm` script and compiled-function source buffers and source-map URI strings through a bounded per-VM weak index, including after compilation-cache eviction.
 
 - Honor `BUN_FEATURE_FLAG_DISABLE_SOURCE_MAPS` on transpiler-cache hits and prevent startup crashes from cached modules without maps. Adapts empty-map validation from [oven-sh/bun#42412](https://github.com/oven-sh/bun/pull/42412); thanks @robobun.

@@ -420,6 +420,7 @@ const uint8_t cryptoKeyOKPOpNameTagMaximumValue = 1;
  * Version 15. ErrorInstance records include an own data cause, traversed as part of the graph.
  */
 [[maybe_unused]] static constexpr unsigned CurrentVersion = 15;
+static constexpr unsigned DefaultVersion = 14;
 static constexpr unsigned FirstVersionWithErrorCause = 15;
 // Deserializers must not pool the version 14 terminal types for older payloads,
 // whose writers never counted them, or the pool indices stop matching the writer's.
@@ -439,7 +440,7 @@ static constexpr unsigned StringDataIs8BitFlag = 0x80000000;
  * minimum sized unsigned integer type required to represent the maximum index
  * in the constant pool.
  *
- * SerializedValue :- <CurrentVersion:uint32_t> Value
+ * SerializedValue :- <version:uint32_t> Value
  * Value :- Array | Object | Map | Set | Error | Terminal
  *
  * Array :-
@@ -457,6 +458,7 @@ static constexpr unsigned StringDataIs8BitFlag = 0x80000000;
  *
  * Error :- ErrorInstanceTag <type:uint8_t> <message:NullableString> <line:uint32_t> <column:uint32_t>
  *     <sourceURL:NullableString> <stack:NullableString> <hasCause:uint8_t> Value?
+ *     (hasCause and its value are present only in version 15; version 14 is otherwise emitted.)
  *
  * Terminal :-
  *      UndefinedTag
@@ -730,20 +732,22 @@ public:
 #endif
         Vector<uint8_t>& out, SerializationContext context, ArrayBufferContentsArray& sharedBuffers,
         Vector<void*>& serializedBlockListRefs,
-        SerializationForStorage forStorage, SerializationForCrossProcessTransfer forTransfer, bool* hasBufferEnvelope)
+        SerializationForStorage forStorage, SerializationForCrossProcessTransfer forTransfer, bool* hasBufferEnvelope, JSArray* legacyNodeBuffers)
     {
         CloneSerializer serializer(lexicalGlobalObject, messagePorts, arrayBuffers,
 #if ENABLE(WEBASSEMBLY)
             wasmModules,
             wasmMemoryHandles,
 #endif
-            out, context, sharedBuffers, forStorage, forTransfer, hasBufferEnvelope != nullptr);
+            out, context, sharedBuffers, forStorage, forTransfer, hasBufferEnvelope != nullptr, legacyNodeBuffers);
         auto code = serializer.serialize(value);
         if (code == SerializationReturnCode::SuccessfullyCompleted && hasBufferEnvelope) {
             *hasBufferEnvelope = serializer.finishBufferEnvelope();
             if (serializer.m_failed)
                 code = SerializationReturnCode::UnspecifiedError;
         }
+        if (code == SerializationReturnCode::SuccessfullyCompleted)
+            serializer.finishErrorCauseFormat();
         serializedBlockListRefs = WTF::move(serializer.m_serializedBlockListRefs);
         return code;
     }
@@ -756,7 +760,7 @@ private:
         WasmModuleArray& wasmModules,
         WasmMemoryHandleArray& wasmMemoryHandles,
 #endif
-        Vector<uint8_t>& out, SerializationContext context, ArrayBufferContentsArray& sharedBuffers, SerializationForStorage forStorage, SerializationForCrossProcessTransfer forTransfer, bool preserveNodeBuffers = false)
+        Vector<uint8_t>& out, SerializationContext context, ArrayBufferContentsArray& sharedBuffers, SerializationForStorage forStorage, SerializationForCrossProcessTransfer forTransfer, bool preserveNodeBuffers, JSArray* legacyNodeBuffers)
         : CloneBase(lexicalGlobalObject)
         , m_buffer(out)
         , m_emptyIdentifier(Identifier::fromString(lexicalGlobalObject->vm(), emptyString()))
@@ -769,8 +773,11 @@ private:
         , m_forStorage(forStorage)
         , m_forTransfer(forTransfer)
         , m_preserveNodeBuffers(preserveNodeBuffers)
+        , m_legacyNodeBuffers(legacyNodeBuffers)
     {
-        write(CurrentVersion);
+        write(DefaultVersion);
+        if (legacyNodeBuffers)
+            m_gcBuffer.appendWithCrashOnOverflow(legacyNodeBuffers);
         fillTransferMap(messagePorts, m_transferredMessagePorts);
         fillTransferMap(arrayBuffers, m_transferredArrayBuffers);
     }
@@ -1131,7 +1138,8 @@ private:
         bool hasCause = false;
         // Snapshot and root before metadata getters/coercions can replace the cause or collect it.
         // Worker error events retain their separate bounded, best-effort metadata owner.
-        if (m_context != SerializationContext::WorkerError) {
+        bool supportsCause = m_context != SerializationContext::WorkerError && m_context != SerializationContext::LegacyIPC;
+        if (supportsCause) {
             JSC::PropertyDescriptor descriptor;
             bool found = errorInstance->getOwnPropertyDescriptor(m_lexicalGlobalObject, vm.propertyNames->cause, descriptor);
             RETURN_IF_EXCEPTION(scope, JSValue());
@@ -1209,7 +1217,11 @@ private:
         write(column);
         writeNullableString(sourceURL);
         writeNullableString(stack);
-        write(static_cast<uint8_t>(hasCause));
+        if (supportsCause) {
+            m_errorCauseOffsets.append(m_buffer.size());
+            write(static_cast<uint8_t>(hasCause));
+            m_hasErrorCause |= hasCause;
+        }
         return cause;
     }
 
@@ -1387,7 +1399,7 @@ private:
                     bool isBuffer = isNodeBuffer(obj);
                     RETURN_IF_EXCEPTION(scope, false);
                     if (isBuffer)
-                        m_nodeBufferIndices.append(m_objectPool.find(obj)->value);
+                        m_nodeBuffers.append(obj);
                 }
                 return success;
             }
@@ -1686,22 +1698,70 @@ private:
         writeConstantPoolIndex(m_objectPool, i);
     }
 
-    // Buffer identities are known only after the real walk: Error metadata and
-    // ordinary getters can replace values that have not been visited yet. Wrap
-    // those already-written bytes, never visit application objects a second time.
-    // The leading envelope array adds one object-pool slot, so reference indexes
-    // (and their widths at 255/65535 slots) must shift. Strings do not shift.
+    void finishErrorCauseFormat()
+    {
+        if (m_hasErrorCause) {
+            m_buffer[0] = CurrentVersion;
+            return;
+        }
+        size_t removed = 0;
+        for (auto& reference : m_objectReferences) {
+            while (removed < m_errorCauseOffsets.size() && m_errorCauseOffsets[removed] < reference.offset)
+                ++removed;
+            reference.offset -= removed;
+        }
+        size_t readOffset = 0;
+        size_t writeOffset = 0;
+        for (auto offset : m_errorCauseOffsets) {
+            size_t length = offset - readOffset;
+            memmove(m_buffer.mutableSpan().data() + writeOffset, m_buffer.span().data() + readOffset, length);
+            writeOffset += length;
+            readOffset = offset + 1;
+        }
+        size_t length = m_buffer.size() - readOffset;
+        memmove(m_buffer.mutableSpan().data() + writeOffset, m_buffer.span().data() + readOffset, length);
+        m_buffer.shrink(writeOffset + length);
+        m_errorCauseOffsets.clear();
+    }
+
+    // Retain the v14 pre-scan's Buffer order and framing. Only cause-bearing
+    // graphs add identities discovered by the native walk.
     bool finishBufferEnvelope()
     {
-        if (m_nodeBufferIndices.isEmpty())
-            return false; // Preserve byte-for-byte bare framing, including Errors.
+        auto& vm = m_lexicalGlobalObject->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        JSArray* buffers = m_legacyNodeBuffers;
+        if (m_hasErrorCause && !m_nodeBuffers.isEmpty()) {
+            if (!buffers) {
+                buffers = constructEmptyArray(m_lexicalGlobalObject, static_cast<ArrayAllocationProfile*>(nullptr));
+                RETURN_IF_EXCEPTION(scope, false);
+                m_gcBuffer.appendWithCrashOnOverflow(buffers);
+            }
+            HashSet<JSObject*> seen;
+            for (unsigned i = 0; i < buffers->length(); ++i)
+                seen.add(buffers->getDirectIndex(m_lexicalGlobalObject, i).getObject());
+            RETURN_IF_EXCEPTION(scope, false);
+            for (auto* buffer : m_nodeBuffers) {
+                if (seen.add(buffer).isNewEntry)
+                    buffers->putDirectIndex(m_lexicalGlobalObject, buffers->length(), buffer);
+                RETURN_IF_EXCEPTION(scope, false);
+            }
+        }
+        if (!buffers)
+            return false;
         if (m_objectPool.size() > std::numeric_limits<uint32_t>::max() - 2) {
             fail();
             return false;
         }
+        write(static_cast<uint32_t>(1));
+        if (serialize(buffers) != SerializationReturnCode::SuccessfullyCompleted) {
+            fail();
+            return false;
+        }
+        finishErrorCauseFormat();
         Vector<uint8_t> valueBytes = WTF::move(m_buffer);
         m_buffer = {};
-        write(CurrentVersion);
+        write(m_hasErrorCause ? CurrentVersion : DefaultVersion);
         write(ArrayTag);
         write(static_cast<uint32_t>(2));
         write(static_cast<uint32_t>(0));
@@ -1728,17 +1788,8 @@ private:
         write(valueBytes.span().data() + cursor, valueBytes.size() - cursor);
         if (m_failed)
             return false;
-        write(static_cast<uint32_t>(1));
-        write(ArrayTag);
-        write(static_cast<uint32_t>(m_nodeBufferIndices.size()));
-        uint32_t index = 0;
-        for (auto bufferIndex : m_nodeBufferIndices) {
-            write(index++);
-            write(ObjectReferenceTag);
-            writeIndex(m_objectPool.size() + 2, bufferIndex + 1);
-        }
         write(TerminatorTag);
-        write(TerminatorTag);
+        m_objectReferences.clear();
         return true;
     }
 
@@ -2096,7 +2147,9 @@ private:
         uint32_t poolSize;
     };
     Vector<ObjectReference> m_objectReferences;
-    Vector<uint32_t> m_nodeBufferIndices;
+    Vector<JSObject*> m_nodeBuffers;
+    Vector<size_t> m_errorCauseOffsets;
+    bool m_hasErrorCause { false };
     ObjectPool m_objectPool;
     ObjectPool m_transferredMessagePorts;
     ObjectPool m_transferredArrayBuffers;
@@ -2113,6 +2166,7 @@ private:
     SerializationForStorage m_forStorage;
     SerializationForCrossProcessTransfer m_forTransfer;
     bool m_preserveNodeBuffers;
+    JSArray* m_legacyNodeBuffers;
 };
 
 SYSV_ABI void SerializedScriptValue::writeBytesForBun(CloneSerializer* ctx, const uint8_t* data, uint32_t size)
@@ -4653,11 +4707,22 @@ static bool isObjectFastPathCandidate(Structure* structure)
     return true;
 }
 
-ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::createForNode(JSGlobalObject& globalObject, JSValue value, SerializationForStorage forStorage, SerializationForCrossProcessTransfer forTransfer, bool& hasBufferEnvelope)
+ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::createForNode(JSGlobalObject& globalObject, JSValue value, SerializationForStorage forStorage, SerializationForCrossProcessTransfer forTransfer, bool& hasBufferEnvelope, SerializationContext context)
 {
+    auto& vm = globalObject.vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto* global = jsCast<Zig::GlobalObject*>(&globalObject);
+    auto* tagFunction = global->m_ipcTagAdvancedBuffersFunction.getInitializedOnMainThread(global);
+    MarkedArgumentBuffer args;
+    args.append(value);
+    auto tagged = JSC::call(global, tagFunction, JSC::getCallData(tagFunction), jsUndefined(), args);
+    RETURN_IF_EXCEPTION(scope, Exception { ExistingExceptionError });
+    Strong<JSObject> taggedRoot(vm, tagged.getObject());
+    auto* legacyBuffers = tagged.isNull() ? nullptr : jsCast<JSArray*>(asArray(tagged)->getDirectIndex(global, 1));
+    RETURN_IF_EXCEPTION(scope, Exception { ExistingExceptionError });
     Vector<RefPtr<MessagePort>> ports;
     hasBufferEnvelope = false;
-    return create(globalObject, value, {}, ports, forStorage, SerializationErrorMode::Throwing, SerializationContext::Default, forTransfer, &hasBufferEnvelope);
+    RELEASE_AND_RETURN(scope, create(globalObject, value, {}, ports, forStorage, SerializationErrorMode::Throwing, context, forTransfer, &hasBufferEnvelope, legacyBuffers));
 }
 
 RefPtr<SerializedScriptValue> SerializedScriptValue::create(JSC::JSGlobalObject& globalObject, JSC::JSValue value, SerializationForStorage forStorage, SerializationErrorMode throwExceptions, SerializationContext serializationContext, SerializationForCrossProcessTransfer forTransfer)
@@ -4674,7 +4739,7 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalOb
     return create(globalObject, value, WTF::move(transferList), messagePorts, forStorage, SerializationErrorMode::Throwing, serializationContext, forTransfer);
 }
 
-ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalObject& lexicalGlobalObject, JSValue value, Vector<JSC::Strong<JSC::JSObject>>&& transferList, Vector<RefPtr<MessagePort>>& messagePorts, SerializationForStorage forStorage, SerializationErrorMode throwExceptions, SerializationContext context, SerializationForCrossProcessTransfer forTransfer, bool* hasBufferEnvelope)
+ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalObject& lexicalGlobalObject, JSValue value, Vector<JSC::Strong<JSC::JSObject>>&& transferList, Vector<RefPtr<MessagePort>>& messagePorts, SerializationForStorage forStorage, SerializationErrorMode throwExceptions, SerializationContext context, SerializationForCrossProcessTransfer forTransfer, bool* hasBufferEnvelope, JSArray* legacyNodeBuffers)
 {
     VM& vm = lexicalGlobalObject.vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
@@ -4962,7 +5027,7 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalOb
         wasmModules,
         wasmMemoryHandles,
 #endif
-        buffer, context, *sharedBuffers, serializedBlockListRefs, forStorage, forTransfer, hasBufferEnvelope);
+        buffer, context, *sharedBuffers, serializedBlockListRefs, forStorage, forTransfer, hasBufferEnvelope, legacyNodeBuffers);
 
     auto releaseSerializedBlockListRefs = [&] {
         for (auto* ptr : serializedBlockListRefs)
