@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe } from "harness";
-import v8 from "node:v8";
 import { createHash } from "node:crypto";
+import v8 from "node:v8";
 import legacyGolden from "./legacy-clone-golden.fixture.json";
 import { legacyGraphs } from "./legacy-clone-graphs.fixture.mjs";
 

@@ -1425,7 +1425,7 @@ private:
                     dummyModules,
                     dummyMemoryHandles,
 #endif
-                    serializedKey, SerializationContext::Default, dummySharedBuffers, m_forStorage, m_forTransfer);
+                    serializedKey, SerializationContext::Default, dummySharedBuffers, m_forStorage, m_forTransfer, false, nullptr);
                 rawKeySerializer.write(key);
                 write(serializedKey);
                 return true;
@@ -4711,14 +4711,14 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::createForNode(JSG
 {
     auto& vm = globalObject.vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* global = jsCast<Zig::GlobalObject*>(&globalObject);
+    auto* global = uncheckedDowncast<Zig::GlobalObject>(&globalObject);
     auto* tagFunction = global->m_ipcTagAdvancedBuffersFunction.getInitializedOnMainThread(global);
     MarkedArgumentBuffer args;
     args.append(value);
     auto tagged = JSC::call(global, tagFunction, JSC::getCallData(tagFunction), jsUndefined(), args);
     RETURN_IF_EXCEPTION(scope, Exception { ExistingExceptionError });
     Strong<JSObject> taggedRoot(vm, tagged.getObject());
-    auto* legacyBuffers = tagged.isNull() ? nullptr : jsCast<JSArray*>(asArray(tagged)->getDirectIndex(global, 1));
+    auto* legacyBuffers = tagged.isNull() ? nullptr : asArray(asArray(tagged)->getDirectIndex(global, 1));
     RETURN_IF_EXCEPTION(scope, Exception { ExistingExceptionError });
     Vector<RefPtr<MessagePort>> ports;
     hasBufferEnvelope = false;
